@@ -1,0 +1,151 @@
+#!/bin/bash
+set -uex
+LANG=C
+LC_ALL=C
+
+MAILFROM=admin@example.com
+MAILFROMNAME="Administrator: NAME"
+MAILTO=nullpopopo@example.com
+MAILTONAME="ぬるぽぽぽ"
+MTA=mail.example.com
+
+URI="${1}"
+PRICELIMIT="${2}"
+
+PROGNAME=$(basename ${0})
+NOW_UNIXTIME=$(date +%s)
+NOW_DATE=$(echo ${NOW_UNIXTIME} | \
+           awk '{print strftime("%Y/%m/%d %H:%M:%S",$1)}')
+USERAGENT="Mozilla/4.0"
+ITEMID=$(echo ${URI}            | \
+         sed -e "s/\//\n/g"     | \
+         egrep ^[A-Z0-9]{10}$)
+LOGDIR=${HOME}/Dropbox/APPS/LOGS
+LOGFILE=${LOGDIR}/${PROGNAME}_$(date +%Y%m).txt
+OLDLOGDIR=${LOGDIR}/OLD
+OLDLOGFILE=${LOGDIR}/${PROGNAME}_$(date +%Y%m --date="1 month ago").txt
+TMPDIR=${HOME}/tmp/${PROGNAME}
+TMPHTMLFILE=${TMPDIR}/${ITEMID}.html
+FLAGDIR=${TMPDIR}
+FLAGFILE=${FLAGDIR}/${ITEMID}_STOP.txt
+
+NG_MSG0="NG: ItemName can not Get."   # 変数 ITEMTITLE に商品名を代入できなかったときのメッセージ
+NG_MSG1="NG: ItemPrice can not Get."  # 変数 NOWLOWPRICE に現在最安値を代入できなかったときのメッセージ
+
+# 先月のログファイルがあれば、過去ログディレクトリへ移動する。
+mkdir -p ${TMPDIR} ${LOGDIR} ${OLDLOGDIR} ${FLAGDIR}
+[ -f ${OLDLOGFILE} ] && mv ${OLDLOGFILE} ${OLDLOGDIR}
+
+# Amazonからサイトを取得して一時ファイル TMPHTMLFILE に書き込む
+## 仕様: curlでの終了ステータスは取得しない。ただhtmlファイルに書き込むだけ。チェックは次の処理で行う。
+curl -s -A ${USERAGENT} ${URI} | \
+tee ${TMPHTMLFILE} > /dev/null
+
+MAILSEND(){
+LANG=ja_JP.utf8 ; export LANG
+LC_ALL=ja_JP.utf8 ; export LC_ALL
+SUBJECT="[${PROGNAME}] PriceInfo: ${NOW_DATE} ${ITEMTITLE}"
+cat << _EOL_                        | \
+    mail -S "smtp=smtp://${MTA}:25"   \
+         -r "${MAILFROM}"             \
+         -s "${SUBJECT}"              \
+            "${MAILTO}"
+${MAILTONAME} 様
+
+Amazonで ${ITEMTITLE} が安くなりました。
+${NOW_DATE} 現在の最安値は ￥${NOWLOWPRICE} です。
+
+ただし、品切れの可能性があるので、以下URIから在庫を確認してください。
+${URI}
+
+-- 
+${PROGNAME}
+${MAILFROMNAME}
+${MAILFROM}
+
+_EOL_
+LANG=C ; export LANG
+LC_ALL=C ; export LC_ALL
+}
+
+# 現在の最安値をロギングする処理を関数 LOGGING_NORMAL にまとめる
+LOGGING_NORMAL() {
+echo -e "${NOW_UNIXTIME}\t$(echo ${NOW_DATE} | \
+         sed -e "s/[[:space:]]/\t/g")\t${ITEMID}\t${URI}\t${ITEMTITLE}\t${NOWLOWPRICE}" | \
+tee -a ${LOGFILE}
+}
+
+# エラー時のロギング処理を関数 LOGGING_NG にまとめる
+LOGGING_NG() {
+echo -e "${NOW_UNIXTIME}\t$(echo ${NOW_DATE} | \
+         sed -e "s/[[:space:]]/\t/g")\t${ITEMID}\t${URI}\t${ERROR_MSG}" | \
+tee -a ${LOGFILE}
+}
+
+# 一時ファイルから商品名を抜き出し、変数 ITEMTITLE に代入する
+ITEMTITLE="$(cat ${TMPHTMLFILE}                                 | \
+             egrep -i "<\/h1>"                                  | \
+             awk 'BEGIN {FS="</div>"} {print $NF}'              | \
+             sed -e "s/^[[:space:]]*//;s/[[:space:]]*<\/h1>//")"
+             if [ ! 0 = $(echo $?) ];
+             then
+               ERROR_MSG=${NG_MSG0}
+               LOGGING_NG
+               exit 1
+             fi
+
+# 一時ファイルから対象商品の最安値を抜き出し、変数 NOWLOWPRICE に代入する
+PRICEGREP="span class=\"a-size-large a-color-price olpOfferPrice a-text-bold\""
+NOWLOWPRICE="$(cat ${TMPHTMLFILE}     | \
+               egrep "(${PRICEGREP})" | \
+               awk '{print $7}'       | \
+               sed -e "s/,//g"        | \
+               sort -n                | \
+               head -n 1)"
+               if [ ! 0 = $(echo $?) ];
+               then
+                 ERROR_MSG=${NG_MSG1}
+                 LOGGING_NG
+                 exit 1
+               fi
+
+# 現在価格が価格監視しきい値を下回ったときの処理を関数 UNDERLIMITACTION にまとめる。
+# 仕様: もしフラグファイルがなければログ記録->フラグファイル作成->メール送信 (MAILSEND関数実行) の順に処理を行う。
+#       もしフラグファイルがあれば、ログ記録のみ行う。この場合、フラグファイル生成も削除もせず、メール送信もしない。
+UNDERLIMITACTION() {
+  if [ ! -f ${FLAGFILE} ];
+  then # フラグファイルがなかったときの処理
+    LOGGING_NORMAL
+    cat ${LOGFILE}    | \
+      egrep ${ITEMID} | \
+      tail -n 1       | \
+      tee ${FLAGFILE}
+    MAILSEND
+  else # フラグファイルがあったときの処理
+    LOGGING_NORMAL
+  fi
+}
+
+# 現在価格が価格監視しきい値を上回ったときの処理を関数 OVERLIMITACTION にまとめる。
+# 仕様: OVERLIMITACTION 関数を実行するときは、いかなる場合でもメール送信を行わない。
+# 仕様: もしフラグファイルがあれば、ログ記録->フラグファイル削除 の順に処理を行う。
+#       もしフラグファイルがなければ、ログ記録のみ行う。この場合、フラグファイル生成も削除もしない。
+OVERLIMITACTION() {
+  if [ -f ${FLAGFILE} ];
+  then # フラグファイルがあったときの処理
+    LOGGING_NORMAL
+    rm -f ${FLAGFILE}
+  else # フラグファイルがなかったときの処理
+    LOGGING_NORMAL
+  fi
+}
+
+# 現在価格が価格監視しきい値を下回ったかどうかで条件分岐を行う。
+# 仕様: 条件が真であれば UNDERLIMITACTION 関数を、
+#       偽であれば OVERLIMITACTION 関数を実行する。
+if [ ${NOWLOWPRICE} -le ${PRICELIMIT} ];
+then # 安かったときの処理
+  UNDERLIMITACTION
+else # 高かったときの処理
+  OVERLIMITACTION
+fi
